@@ -20,6 +20,7 @@ use crossterm::style::{
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use hostname::get as get_hostname;
 use os_pipe::pipe;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use unicode_width::UnicodeWidthChar;
 
 const HEADER_HEIGHT: usize = 2;
@@ -993,7 +994,7 @@ fn save_screenshot(rows: &[Vec<Cell>], dir: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-fn run_command(opts: &Options) -> Result<CommandResult, AppError> {
+fn run_command_pipe(opts: &Options) -> Result<CommandResult, AppError> {
     let (mut reader, writer_out) =
         pipe().map_err(|e| AppError::new(2, format!("pipe failed: {e}")))?;
     let writer_err = writer_out
@@ -1084,6 +1085,133 @@ fn run_command(opts: &Options) -> Result<CommandResult, AppError> {
     })
 }
 
+#[cfg(unix)]
+fn kill_pid(pid: u32) -> io::Result<()> {
+    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn run_command_pty(opts: &Options, width: usize, height: usize) -> Result<CommandResult, AppError> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: height.max(1) as u16,
+        cols: width.max(1) as u16,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(|e| AppError::new(2, format!("pty failed: {e}")))?;
+
+    let cmd = if opts.exec_mode {
+        let exe = opts
+            .command_argv
+            .first()
+            .cloned()
+            .ok_or_else(|| AppError::new(2, "missing command"))?;
+        let mut c = CommandBuilder::new(exe);
+        for arg in opts.command_argv.iter().skip(1) {
+            c.arg(arg);
+        }
+        c
+    } else {
+        let mut c = CommandBuilder::new("sh");
+        c.arg("-c");
+        c.arg(&opts.command_display);
+        c
+    };
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| AppError::new(2, format!("unable to start command: {e}")))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| AppError::new(2, format!("pty reader failed: {e}")))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| AppError::new(2, format!("pty writer failed: {e}")))?;
+
+    let reader_handle = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    });
+
+    let mut interrupted = false;
+    let mut interrupt_started: Option<Instant> = None;
+    let mut kill_sent = false;
+
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| AppError::new(2, format!("failed waiting for command: {e}")))?
+        {
+            break status;
+        }
+
+        if event::poll(Duration::from_millis(50))
+            .map_err(|e| AppError::new(1, format!("poll failed: {e}")))?
+        {
+            match event::read().map_err(|e| AppError::new(1, format!("read event failed: {e}")))? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if !interrupted {
+                        interrupted = true;
+                        interrupt_started = Some(Instant::now());
+                        let _ = writer.write_all(b"\x03");
+                        let _ = writer.flush();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if interrupted && !kill_sent {
+            if let Some(start) = interrupt_started {
+                if start.elapsed() > Duration::from_millis(200) {
+                    #[cfg(unix)]
+                    {
+                        if let Some(pid) = child.process_id() {
+                            let _ = kill_pid(pid);
+                        }
+                    }
+                    kill_sent = true;
+                }
+            }
+        }
+    };
+
+    let output = reader_handle
+        .join()
+        .map_err(|_| AppError::new(2, "reader thread panicked"))?
+        .map_err(|e| AppError::new(2, format!("failed to read command output: {e}")))?;
+
+    let exit_code = status.exit_code().clamp(0, 255) as u8;
+
+    Ok(CommandResult {
+        output,
+        exit_code,
+        interrupted,
+    })
+}
+
+fn run_command(opts: &Options, width: usize, height: usize) -> Result<CommandResult, AppError> {
+    if opts.color {
+        run_command_pty(opts, width, height)
+    } else {
+        run_command_pipe(opts)
+    }
+}
+
 fn wait_for_any_key() -> io::Result<()> {
     loop {
         if let Event::Key(key) = event::read()?
@@ -1116,7 +1244,7 @@ fn run_app(opts: Options) -> Result<i32, AppError> {
     loop {
         if force_run || Instant::now() >= next_run {
             let run_started = Instant::now();
-            let result = run_command(&opts)?;
+            let result = run_command(&opts, state.width, state.main_height)?;
             if result.interrupted {
                 return Ok(130);
             }
