@@ -277,6 +277,20 @@ CASES = [
         steps=seq(("wait_exit", 3),),
     ),
     Case("stdin-inherited", ["-t", "-n", "9", cmd("[ -t 0 ] && echo tty || echo notty")]),
+    Case("beep-on-failure", ["-b", "-n", "0.5", cmd("false")], steps=seq(("sleep", 0.8), ("bell",))),
+    Case("no-beep-on-success", ["-b", "-n", "0.5", cmd("true")], steps=seq(("sleep", 0.8), ("bell",))),
+    Case("no-beep-without-flag", ["-n", "0.5", cmd("false")], steps=seq(("sleep", 0.8), ("bell",))),
+    Case("bell-in-output", ["-t", "-n", "5", cmd("printf 'a\\007b\\n'")], steps=seq(("sleep", 0.8), ("bell",), ("capture",))),
+    Case(
+        "precise",
+        ["-t", "-p", "-n", "1", cmd("echo run >> n; sleep 0.6; wc -l < n")],
+        steps=seq(("sleep", 2.9), ("capture",)),
+    ),
+    Case(
+        "not-precise",
+        ["-t", "-n", "1", cmd("echo run >> n; sleep 0.6; wc -l < n")],
+        steps=seq(("sleep", 2.9), ("capture",)),
+    ),
     Case(
         "suspend-resume",
         ["-n", "20", cmd("echo x")],
@@ -357,6 +371,8 @@ def _run_side(case, impl, workdir, results, barrier):
     else:
         start = f"cd {workdir} && exec env PATH={path} {env_words} {watch} 2>stderr{redirect}"
     tmux("new-session", "-d", "-s", session, "-x", str(case.width), "-y", str(case.height), "sh", "-c", start)
+    # tmux only flags bells in windows that are not being looked at.
+    tmux("new-window", "-d", "-t", session)
     if case.shell:
         time.sleep(0.3)
         tmux("send-keys", "-t", session, "-l", f"{watch} 2>stderr")
@@ -370,6 +386,9 @@ def _run_side(case, impl, workdir, results, barrier):
             time.sleep(step[1])
         elif kind == "capture":
             out["captures"].append(normalize_screen(tmux("capture-pane", "-p", "-e", "-t", session).stdout))
+        elif kind == "bell":
+            flag = tmux("display-message", "-p", "-t", f"{session}:0", "#{window_bell_flag}").stdout.strip()
+            out["captures"].append(f"bell={flag}")
         elif kind == "keys":
             key = step[1]
             if len(key) == 1:
@@ -409,6 +428,9 @@ def _run_side(case, impl, workdir, results, barrier):
     results[impl] = out
 
 
+SHOW = False
+
+
 def run_case(case):
     import threading
 
@@ -426,6 +448,11 @@ def run_case(case):
         t.start()
     for t in threads:
         t.join()
+    if SHOW:
+        for impl, result in results.items():
+            print(f"--- {case.name} [{impl}] exit={result.get('exit')!r}")
+            for capture in result.get("captures", []):
+                print(capture)
     return compare(case.name, results.get("upstream"), results.get("port"))
 
 
@@ -475,7 +502,10 @@ def main():
     parser.add_argument("filter", nargs="*", help="only run cases whose name contains one of these")
     parser.add_argument("-j", "--jobs", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=1, help="run each case this many times")
+    parser.add_argument("--show", action="store_true", help="print every capture")
     args = parser.parse_args()
+    global SHOW
+    SHOW = args.show
 
     tmux("-f", "/dev/null", "start-server", check=False)
     tmux("set-option", "-g", "default-terminal", "tmux-256color", check=False)
