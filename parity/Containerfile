@@ -1,0 +1,22 @@
+FROM debian:trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake autopoint build-essential ca-certificates curl faketime gettext \
+        git libncurses-dev libtool locales pkg-config python3 tmux \
+    && sed -i -e 's/# en_US.UTF-8/en_US.UTF-8/' -e 's/# de_DE.UTF-8/de_DE.UTF-8/' /etc/locale.gen \
+    && locale-gen \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG PROCPS_REF=master
+RUN git clone https://gitlab.com/procps-ng/procps.git /src/procps \
+    && cd /src/procps \
+    && git checkout "$PROCPS_REF" \
+    && ./autogen.sh \
+    && ./configure --disable-nls --without-systemd --enable-watch8bit \
+    && make src/watch \
+    && install -m 755 src/watch /usr/local/bin/watch-upstream \
+    && git rev-parse HEAD > /usr/local/share/procps-ref
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+WORKDIR /work
