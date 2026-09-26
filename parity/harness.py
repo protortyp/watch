@@ -249,9 +249,11 @@ CASES = [
         width=40,
         steps=seq(("sleep", 0.8), ("resize", 30, 6), ("sleep", 0.25), ("capture",), ("sleep", 0.7), ("capture",)),
     ),
+    # Without the header: tmux crops the right-aligned run time, which would
+    # defeat masking it.
     Case(
         "resize-no-rerun",
-        ["-r", "-n", "5", cmd("echo run")],
+        ["-t", "-r", "-n", "5", cmd("echo run; echo 0123456789012345678901234567890123456789")],
         width=40,
         steps=seq(("sleep", 0.6), ("resize", 30, 6), ("sleep", 0.5), ("capture",)),
     ),
@@ -406,6 +408,9 @@ def _run_side(case, impl, workdir, results, barrier):
                 dead = tmux("display-message", "-p", "-t", session, "#{pane_dead} #{pane_dead_status}").stdout.split()
                 if dead and dead[0] == "1":
                     out["exit"] = int(dead[1]) if len(dead) > 1 else None
+                    # tmux can notice the exit before it has processed the
+                    # last output, such as leaving the alternate screen.
+                    time.sleep(0.3)
                     break
                 time.sleep(0.05)
             else:
